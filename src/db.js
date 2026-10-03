@@ -172,6 +172,20 @@ CREATE TABLE IF NOT EXISTS publish_schedules (
 CREATE INDEX IF NOT EXISTS idx_schedules_due
   ON publish_schedules(status, scheduled_at);
 
+-- ============ 版本撤回（编辑者按版本号撤回整版公开展示） ============
+-- 只追加审计记录：确认撤回后不改写任何历史快照（versions / version_events /
+-- version_relations 原样保留），版本号也不复用；访客读出层动态隐藏撤回版
+-- （最新年表指向编号最大的未撤回版，撤回版详情与引用它的路线按不存在处理），
+-- 持编辑口令的接口仍可见撤回版原文与撤回原因。
+-- 同一版本至多一条记录（UNIQUE）：重复撤回返回首次记录，不覆盖原因。
+CREATE TABLE IF NOT EXISTS version_retractions (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_no   INTEGER NOT NULL UNIQUE,         -- 被撤回的已发布版本号
+  reason       TEXT NOT NULL,                   -- 非空撤回原因（编年依据错误说明）
+  editor       TEXT NOT NULL DEFAULT '',
+  retracted_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ============ 专题「先于」脉络路线（不可变，只追加） ============
 -- 编辑者从一份已发布年表挑选至少两个互异事件作为锚点（有序），
 -- 相邻锚点之间必须在该版「先于」关系图中存在有向路径；

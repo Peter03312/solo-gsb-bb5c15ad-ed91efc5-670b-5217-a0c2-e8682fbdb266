@@ -24,6 +24,14 @@ const {
   applyRedactionToRoute,
   listRoutes,
 } = require('./route');
+const {
+  retractVersion,
+  getRetraction,
+  isRetracted,
+  retractedVersionNoSet,
+  latestVisibleVersionNo,
+  listRetractions,
+} = require('./retract');
 const scheduler = require('./scheduler');
 
 const router = express.Router();
@@ -104,12 +112,18 @@ function readClaimPayload(body) {
 }
 
 // ================= 公开接口（访客，无需口令） =================
-// 只暴露最新已发布版本的不可变快照，不触碰草稿。
+// 只暴露未撤回的已发布版本快照，不触碰草稿；撤回版一律按不存在处理。
 
 router.get('/api/public/chronicle', (req, res) => {
-  const no = latestVersionNo();
+  // 访客最新年表指向编号最大的未撤回版
+  const no = latestVisibleVersionNo();
   if (no === 0) {
-    return res.json({ published: false, message: '年表尚未发布任何版本' });
+    const anyPublished = latestVersionNo() > 0;
+    return res.json({
+      published: false,
+      ...(anyPublished ? { allRetracted: true } : {}),
+      message: anyPublished ? '尚无可读版本：已发布版本均已撤回' : '年表尚未发布任何版本',
+    });
   }
   // 访客视图：命中已登记出处的位置统一显示「出处已遮盖」，其余字段与版本号不变
   const version = applyRedactionToVersion(getVersionDetail(no));
@@ -117,35 +131,40 @@ router.get('/api/public/chronicle', (req, res) => {
 });
 
 router.get('/api/public/versions', (req, res) => {
-  const no = latestVersionNo();
+  const retracted = retractedVersionNoSet();
   const rows = getDb()
     .prepare(
       `SELECT version_no AS versionNo, parent_no AS parentNo, editor, note, published_at AS publishedAt
          FROM versions ORDER BY version_no DESC`
     )
-    .all();
-  res.json({ currentVersionNo: no, versions: rows });
+    .all()
+    .filter((v) => !retracted.has(v.versionNo));
+  res.json({ currentVersionNo: latestVisibleVersionNo(), versions: rows });
 });
 
 router.get('/api/public/versions/:no', (req, res) => {
   const no = Number(req.params.no);
   const detail = getVersionDetail(no);
-  if (!detail) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
+  // 撤回版对访客按不存在处理
+  if (!detail || isRetracted(no)) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
   // 访客读取指定历史版本同样应用出处遮盖
   res.json({ version: applyRedactionToVersion(detail) });
 });
 
 // ---- 专题「先于」脉络路线（公开只读） ----
 // 只展示路线涉及的事件与关系；出处命中遮盖登记的位置显示「出处已遮盖」。
+// 引用撤回版的路线对访客隐藏。
 router.get('/api/public/routes', (req, res) => {
-  res.json({ routes: listRoutes() });
+  const retracted = retractedVersionNoSet();
+  res.json({ routes: listRoutes().filter((r) => !retracted.has(r.versionNo)) });
 });
 
 router.get('/api/public/routes/:no', (req, res) => {
   const no = Number(req.params.no);
   if (!Number.isInteger(no) || no < 1) throw badRequest('路线号必须是正整数');
   const detail = getRouteDetail(no);
-  if (!detail) throw { status: 404, message: `路线 ${req.params.no} 不存在` };
+  // 引用撤回版的路线对访客按不存在处理
+  if (!detail || isRetracted(detail.versionNo)) throw { status: 404, message: `路线 ${req.params.no} 不存在` };
   res.json({ route: applyRedactionToRoute(detail) });
 });
 
@@ -167,6 +186,7 @@ router.get('/api/editor/state', (req, res) => {
     }));
   res.json({
     currentVersionNo: latestVersionNo(),
+    latestVisibleVersionNo: latestVisibleVersionNo(),
     currentVersion: getVersionSummary(latestVersionNo()) || null,
     draftRevisionNo: draftRevisionNo(),
     events,
@@ -323,7 +343,8 @@ router.post('/api/editor/publish', (req, res) => {
   res.status(201).json({ ok: true, ...result });
 });
 
-// 版本列表（编辑者视角，结构与公开一致）
+// 版本列表（编辑者视角）：在公开结构基础上附加撤回状态与原因；
+// currentVersionNo 仍是最高已发布版本号（含撤回版，发布/预约基准不变）。
 router.get('/api/editor/versions', (req, res) => {
   const no = latestVersionNo();
   const rows = getDb()
@@ -331,8 +352,35 @@ router.get('/api/editor/versions', (req, res) => {
       `SELECT version_no AS versionNo, parent_no AS parentNo, editor, note, published_at AS publishedAt
          FROM versions ORDER BY version_no DESC`
     )
-    .all();
-  res.json({ currentVersionNo: no, versions: rows });
+    .all()
+    .map((v) => {
+      const retraction = getRetraction(v.versionNo);
+      return { ...v, retracted: retraction !== null, retraction };
+    });
+  res.json({ currentVersionNo: no, latestVisibleVersionNo: latestVisibleVersionNo(), versions: rows });
+});
+
+// ---- 撤回已发布版本：按版本号与非空原因，只追加审计记录（快照与版本号不变） ----
+// 体含 reason（非空撤回原因）、editor（可选）。版本不存在 404、原因非法 400，均不改状态；
+// 重复撤回幂等返回首次记录（alreadyRetracted: true），不覆盖原因。
+router.post('/api/editor/versions/:no/retract', (req, res) => {
+  const no = Number(req.params.no);
+  if (!Number.isInteger(no) || no < 1) throw badRequest('版本号必须是正整数');
+  const result = retractVersion({
+    versionNo: no,
+    reason: req.body && req.body.reason,
+    editor: optionalString(req.body || {}, 'editor', 200),
+  });
+  res.json(result);
+});
+
+// 已撤回版本清单（编辑者视角，含撤回原因与撤回时间）
+router.get('/api/editor/retractions', (req, res) => {
+  res.json({
+    currentVersionNo: latestVersionNo(),
+    latestVisibleVersionNo: latestVisibleVersionNo(),
+    retractions: listRetractions(),
+  });
 });
 
 // ---- 从已发布版本恢复草稿：只读预览，不改数据 ----
@@ -342,7 +390,8 @@ router.get('/api/editor/restore-preview/:no', (req, res) => {
   if (!Number.isInteger(no) || no < 1) throw badRequest('版本号必须是正整数');
   const preview = buildRestorePreview(no);
   if (!preview) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
-  res.json({ ok: true, ...preview });
+  // 撤回版同样可恢复（编辑者功能）；附带撤回信息提示
+  res.json({ ok: true, ...preview, retraction: getRetraction(no) });
 });
 
 // ---- 确认恢复：原子替换整个草稿 ----
@@ -394,12 +443,13 @@ router.post('/api/editor/import', (req, res) => {
 // ---- 已发布版本原文（持编辑口令）：不应用出处遮盖 ----
 // 访客公开接口中命中遮盖登记的 source 显示「出处已遮盖」；
 // 编辑者持口令通过本接口仍可查看快照原文（恢复草稿亦使用原文，不受影响）。
+// 撤回版同样可见原文；响应附带撤回信息（未撤回为 null）。
 router.get('/api/editor/versions/:no/raw', (req, res) => {
   const no = Number(req.params.no);
   if (!Number.isInteger(no) || no < 1) throw badRequest('版本号必须是正整数');
   const detail = getVersionDetail(no);
   if (!detail) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
-  res.json({ version: detail });
+  res.json({ version: detail, retraction: getRetraction(no) });
 });
 
 // ---- 按出处原文撤回公开展示：只读预览，不改数据 ----
@@ -494,18 +544,23 @@ router.post('/api/editor/routes', (req, res) => {
   res.status(201).json({ ok: true, route });
 });
 
-// 路线清单（编辑者视角，结构与公开一致）
+// 路线清单（编辑者视角）：在公开结构基础上附加所据版本是否已撤回的标记；
+// 引用撤回版的路线编辑者仍可见（访客清单中隐藏）。
 router.get('/api/editor/routes', (req, res) => {
-  res.json({ routes: listRoutes() });
+  const retracted = retractedVersionNoSet();
+  res.json({
+    routes: listRoutes().map((r) => ({ ...r, versionRetracted: retracted.has(r.versionNo) })),
+  });
 });
 
 // 路线详情原文（持编辑口令）：不应用出处遮盖，访客公开接口中命中处显示「出处已遮盖」
+// 引用撤回版的路线编辑者仍可查看；响应附带 versionRetracted 标记。
 router.get('/api/editor/routes/:no/raw', (req, res) => {
   const no = Number(req.params.no);
   if (!Number.isInteger(no) || no < 1) throw badRequest('路线号必须是正整数');
   const detail = getRouteDetail(no);
   if (!detail) throw { status: 404, message: `路线 ${req.params.no} 不存在` };
-  res.json({ route: detail });
+  res.json({ route: detail, versionRetracted: isRetracted(detail.versionNo) });
 });
 
 module.exports = router;

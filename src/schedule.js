@@ -13,9 +13,12 @@
 //
 // 到期执行（runDueSchedules，由 scheduler 周期触发，启动时立即补跑一次）：
 //   按 (scheduled_at, 预约号) 顺序逐条在各自事务内处理：
-//   - 仅当冻结基准版本号仍等于当前最新版本号时，用冻结内容写出一个不可变新版本，
+//   - 仅当冻结基准版本号仍等于当前最新版本号、且该基准版未被撤回时，
+//     用冻结内容写出一个不可变新版本，
 //     状态置 published（写版本与翻状态在同一事务，失败整体回滚，不留半版）；
 //   - 否则置 conflict 并保留冻结内容供编辑者查看，不自动改基准、不发布。
+//   - 撤回与到期发布竞争时按事务提交顺序裁决：撤回先提交则本预约到期转冲突；
+//     发布先提交则新版本保留，撤回仅作用于指定版。
 // 重启 / 重复触发只处理 pending 行；published/conflict/cancelled 永不重复发布。
 //
 // 取消（cancelSchedule）：只有 pending（尚未执行）可取消；已执行（published/conflict）
@@ -29,6 +32,7 @@ const {
   latestVersionNo,
   getVersionSummary,
 } = require('./publish');
+const { isRetracted } = require('./retract');
 const { draftRevisionNo } = require('./restore');
 
 const STATUSES = ['pending', 'published', 'conflict', 'cancelled'];
@@ -203,10 +207,14 @@ function processOne(row, published, conflicts) {
 
     const latest = latestVersionNo();
     const base = row.base_version_no;
-    if (base !== latest) {
-      const message =
-        `预约到期时冻结的基准版本号（第 ${base} 版）已不等于当前最新版本号（第 ${latest} 版），` +
-        '未自动发布、未改动基准；冻结内容保留如下，可重新核对后即时发布或另建预约。';
+    // 冻结基准版已被撤回（撤回事务先于本事务提交）→ 到期转冲突，不生成新版本
+    const baseRetracted = base >= 1 && isRetracted(base);
+    if (base !== latest || baseRetracted) {
+      const message = baseRetracted
+        ? `预约到期时，冻结的基准版本（第 ${base} 版）已被撤回（编年依据错误），` +
+          '本预约转为冲突：未自动发布、未生成新版本；冻结内容完整保留如下，可核对后即时发布或另建预约。'
+        : `预约到期时冻结的基准版本号（第 ${base} 版）已不等于当前最新版本号（第 ${latest} 版），` +
+          '未自动发布、未改动基准；冻结内容保留如下，可重新核对后即时发布或另建预约。';
       db.prepare(
         `UPDATE publish_schedules
             SET status = 'conflict', result_message = ?, attempted_at = ?
