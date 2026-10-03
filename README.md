@@ -94,8 +94,8 @@ PORT=8080 EDITOR_TOKEN=my-secret npm start
 - **建立即冻结**：预约成功时，系统把当时的**事件、每事件所选主张、「先于」关系、求解日期**与**当前最新版本号（冻结基准版本号）**整体复制进预约。此后编辑者修改草稿、增删主张、从历史版本恢复草稿，**都不改变预约内容**；到期前访客仍只见当前最新版本。
 - **建立即校验**：时间必须是合法的未来 UTC 时刻（形如 `2026-10-02T12:34:00Z`，只接受 `Z` 结尾；秒可省略）。时间非法或已过期返回 **400**（`INVALID_SCHEDULED_TIME`）；主张选择为空 **400**；草稿不能通过现有发布校验（缺主张 / 成环 / 时间无解）返回 **422**（与即时发布同一错误结构）；`baseVersionNo` 不等于当前最新版本号返回 **409** `VERSION_CONFLICT`。**以上情况都不建立预约**。
 - **到期执行**：调度器在服务启动时立即补跑一次（停机期间到期的预约不丢失），之后每 1 秒检查一次（可用 `SCHEDULE_TICK_MS` 调整）。到期的待执行预约按**预约时间、预约号顺序**逐条处理：
-  - 仅当**冻结的基准版本号仍等于当前最新版本号**时，用冻结内容在一个事务内**生成一个不可变新版本**（写版本与翻转预约状态同事务，失败整体回滚，绝不留半版）；
-  - 否则把预约标记为 **冲突（conflict）**：**不发布、不自动改基准**，冻结的完整内容保留在预约详情中供编辑者查看，编辑者可核对后即时发布或另建预约。
+  - 仅当**冻结的基准版本号仍等于当前最新版本号**、且该基准版**未被撤回**时，用冻结内容在一个事务内**生成一个不可变新版本**（写版本与翻转预约状态同事务，失败整体回滚，绝不留半版）；
+  - 否则把预约标记为 **冲突（conflict）**：**不发布、不自动改基准**，冻结的完整内容保留在预约详情中供编辑者查看，编辑者可核对后即时发布或另建预约。基准版被撤回（见下节）同样到期转冲突，不生成新版本。
 - **幂等与重启安全**：重启服务或重复触发都**不会重复发布**——只有 `pending`（待执行）状态的预约会被处理，已发布 / 冲突 / 已取消的预约永不再执行。
 - **查看与取消**：编辑者在工作台「发布」卡片中可查看全部预约（待执行的在前，显示倒计时、冻结基准版本号与冻结事件摘要）、展开冻结详情。**尚未执行的预约可随时取消**（取消幂等）；**已生效（已发布 / 冲突）的预约不能取消**（409 `SCHEDULE_NOT_CANCELLABLE`）。
 - 预约生成的新版本与即时发布完全同源（同一快照构造与求解逻辑），**公开读取继续应用出处遮盖**；即时发布、历史版本读取与原有接口保持兼容。
@@ -120,6 +120,48 @@ curl -s -X DELETE -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/schedules/1"  # 
 ```
 
 到期后预约详情的 `status` 变为 `published`（附 `resultVersionNo`）或 `conflict`（附 `resultMessage`，冻结内容仍在 `frozen` 中）。完整可运行的端到端示例见 `examples/schedule-example.sh`（建预约、改草稿验证冻结、等待自动发布、抢先发布触发冲突、取消与各类 400/409/422，约 25 秒）。
+
+### 撤回已发布版本（编年依据错误）
+
+编辑者发现某版年表的编年依据错误时，可按**版本号 + 非空原因**撤回该版（编辑台「已发布版本」中每版的「撤回该版」按钮，或直接调用 HTTP API）：
+
+- **只追加审计记录**：撤回只在 `version_retractions` 表追加一行（版本号、原因、编辑者、时间）；**历史快照与版本号一律不改**，编辑者持口令仍可查看撤回版原文（`GET /api/editor/versions/:no/raw`）与撤回原因。
+- **重复撤回幂等**：同一版本重复撤回返回 **200** 与**首次记录**（`alreadyRetracted: true`），**不覆盖原因、不重复落库**；首次撤回返回 **201**。
+- **访客视图**：
+  - 最新年表指向**编号最大的未撤回版**；若全部撤回则显示「已发布版本均已撤回，尚无可读版本」；
+  - 版本清单（`GET /api/public/versions`）隐藏撤回版；指定撤回版读取（`GET /api/public/versions/:no`）按不存在处理（**404**）；
+  - **引用撤回版的专题路线**从公开清单隐藏，直接访问详情同样 **404**；编辑者路线清单仍列出（带 `versionRetracted` 标记）且可查看原文。不能基于已撤回版建立新路线（**409** `VERSION_RETRACTED`）。
+- **发布与预约基准不变**：即时发布与预约仍以**最高已发布版本号**（含撤回版）为基准，编号继续递增——撤回第 N 版后，`baseVersionNo` 仍须填 N，发布成功得第 N+1 版。
+- **预约联动**：以已撤回版为冻结基准的**待执行预约**到期转为**冲突**（`conflict`，原因注明基准已撤回），**不生成新版本**，冻结内容保留供查看。撤回与到期发布竞争时按**事务提交顺序**裁决：撤回先提交则预约转冲突；发布先提交则新版本保留，撤回仅作用于指定旧版。
+- **错误处理**：版本不存在 **404**、原因为空 / 纯空白 / 非字符串 **400**，均不改动任何状态。
+
+```bash
+TOKEN=editor
+BASE=http://localhost:3000
+
+# 撤回第 2 版（原因必填）
+curl -s -X POST "$BASE/api/editor/versions/2/retract" \
+  -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"reason":"「抽水机到站」编年依据错误，受访人更正为 1963 年","editor":"志愿者小王"}'
+# => 201 {"ok":true,"alreadyRetracted":false,
+#        "retraction":{"versionNo":2,"reason":"…","editor":"志愿者小王","retractedAt":"…"},
+#        "currentVersionNo":2,        ← 发布基准（最高已发布版本号，含撤回版）
+#        "latestVisibleVersionNo":1}  ← 访客当前可读版本
+
+# 重复撤回：200，返回首次记录，不覆盖原因
+curl -s -X POST "$BASE/api/editor/versions/2/retract" \
+  -H "Content-Type: application/json" -H "X-Editor-Token: $TOKEN" \
+  -d '{"reason":"试图改写的原因"}'
+# => 200 {"ok":true,"alreadyRetracted":true,"retraction":{"versionNo":2,"reason":"「抽水机到站」…"}}
+
+curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/retractions"   # 撤回审计清单（编辑者）
+curl -s "$BASE/api/public/chronicle"        # 访客最新年表：退到编号最大的未撤回版
+curl -s "$BASE/api/public/versions"         # 访客清单：不含第 2 版
+curl -s "$BASE/api/public/versions/2"       # 404（按不存在处理）
+curl -s -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/versions/2/raw"  # 编辑者仍可见原文
+```
+
+完整可运行的端到端示例见 `examples/retract-example.sh`（连发两版、撤回、访客视图回退、路线隐藏、幂等重复撤回、预约到期转冲突、编号继续递增、全部撤回，约 8 秒）。
 
 ### 从历史版本恢复草稿（预览 → 确认）
 
@@ -271,7 +313,7 @@ curl -s -X DELETE -H "X-Editor-Token: $TOKEN" "$BASE/api/editor/schedules/1"  # 
 - **连通要求**：相邻两个锚点必须在该版「先于」关系图中存在**有向路径**（沿 较早→较晚 方向）。每段路线展示一条**关系数最少**的见证链；长度相同时按**关系 ID 序列**字典序择小。见证链可能经过未列为锚点的**中间事件**。
 - **断点拒绝**：任何一段无法连通即**拒绝整条路线**（不落库），错误中列出全部断点（段序号与两端事件）；未知版本（404）、事件不在该版（422）、重复事件或锚点不足两个（400）同样不保存。
 - **建立即冻结**：路线把**所据版本号、锚点顺序、每段见证链**整体写入只追加的路线表。此后修改草稿、从历史版本恢复草稿、发布新版本，**都不改变旧路线**（路线展示字段读自该版不可变快照）。
-- **公开查看**：访客年表页「专题脉络路线」卡片列出全部路线；路线详情**区分锚点与链上中间事件**，且**只展示路线涉及的事件与关系**；出处按现有公开遮盖规则显示（命中登记的位置显示「出处已遮盖」）。编辑者持口令经 `GET /api/editor/routes/:no/raw` 或编辑台「查看路线」查看**原文**。
+- **公开查看**：访客年表页「专题脉络路线」卡片列出全部路线；路线详情**区分锚点与链上中间事件**，且**只展示路线涉及的事件与关系**；出处按现有公开遮盖规则显示（命中登记的位置显示「出处已遮盖」）。编辑者持口令经 `GET /api/editor/routes/:no/raw` 或编辑台「查看路线」查看**原文**。所据版本被撤回后，该路线对访客隐藏（清单与详情均按不存在处理），编辑者仍可在清单（带 `versionRetracted` 标记）与原文详情中查看；已撤回版也不能再作为新路线的所据版本（409 `VERSION_RETRACTED`）。
 
 ```bash
 TOKEN=editor
@@ -316,17 +358,20 @@ curl -s -H "X-Editor-Token: $TOKEN" \
 
 ### 访客（http://localhost:3000/）
 
-只渲染最新已发布版本：按系统确定的日期排列的时间线、每条事件所选主张的精度与出处、全部「先于」关系及其出处。草稿、未发布主张、未发布关系均不出现在任何公开接口中。尚无发布版本时仅显示「尚未发布」。
+只渲染**编号最大的未撤回版**：按系统确定的日期排列的时间线、每条事件所选主张的精度与出处、全部「先于」关系及其出处。草稿、未发布主张、未发布关系均不出现在任何公开接口中。尚无发布版本时显示「尚未发布」；已发布版本被全部撤回时显示「尚无可读版本」。
 
 凡编辑者已按出处原文登记遮盖的位置，访客在最新年表与任一历史版本中都只看到 **「出处已遮盖」**（快照原文仍在库中，仅持编辑口令的接口可查看）。
 
-页面下方「专题脉络路线」卡片列出编辑者已建立的专题路线：锚点事件按顺序排列，相邻锚点之间展示该版关系图中关系数最少的见证链（锚点与链上中间事件分别标注），只展示路线涉及的事件与关系，出处同样按遮盖规则显示。
+已撤回的版本对访客一律按不存在处理：版本清单不列出、指定版读取返回 404、引用该版的专题路线从公开清单与详情中隐藏。
+
+页面下方「专题脉络路线」卡片列出编辑者已建立、且所据版本未撤回的专题路线：锚点事件按顺序排列，相邻锚点之间展示该版关系图中关系数最少的见证链（锚点与链上中间事件分别标注），只展示路线涉及的事件与关系，出处同样按遮盖规则显示。
 
 ## 数据与备份
 
 - 单文件 SQLite 数据库：容器中位于 `/app/data/chronicle.db`（Docker 卷 `chronicle-data`），本机直跑位于 `./data/chronicle.db`。
 - 备份：停止写入后复制该 `.db` 文件即可（或使用 SQLite 的 `.backup` 命令）。
 - 历史版本表 `versions / version_events / version_relations` 只追加、不更新不删除，保证不可变。
+- 版本撤回表 `version_retractions` 同样只追加：每版至多一行（`version_no` 唯一），记录撤回原因、编辑者与时间；**不回写快照或版本号**。访客可见性、路线隐藏、预约冲突都在读出 / 执行时按本表动态判定；删除对应行即恢复公开。
 - 导入批次表 `import_batches` 记录每次成功导入的批次标识与内容指纹，用于防止同一批次重复导入。
 - 出处遮盖表 `source_redactions` 同样只追加：只存被遮盖的精确出处文本，**不回写快照或草稿**；删除该表对应行即恢复公开显示。
 - 预约发布表 `publish_schedules` 在建立时冻结完整待发布内容（事件 / 所选主张 / 关系 / 求解日期）与基准版本号；`status` 在待执行（`pending`）、已发布（`published`）、冲突（`conflict`）、已取消（`cancelled`）间单向流转。到期写版本与翻状态在同一事务内完成，重启只补跑 `pending` 行。
@@ -347,24 +392,31 @@ src/
   redact.js     出处遮盖：精确出处文本的只读命中预览 + 只追加登记（版本号冲突检查）；公开读出层动态替换为「出处已遮盖」
   schedule.js   预约发布：建立时冻结快照/基准版本号；到期按时间、预约号顺序逐条事务执行（发布或标冲突，幂等不重发不留半版）；查看/取消
   scheduler.js  预约调度器：每秒检查到期预约，服务启动立即补跑（重启安全）
+  retract.js    版本撤回：按版本号 + 非空原因只追加审计记录（重复撤回返回首次记录）；访客读出层隐藏撤回版及其路线；预约到期遇撤回基准转冲突
   route.js      专题脉络路线：锚点校验 + 分层 BFS 求最少关系见证链（同长度按关系 ID 序列择小）+ 冻结落库；公开读出层动态遮盖出处
   seed.js       演示数据
 public/         访客页与编辑台（原生 HTML/CSS/JS）
-examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线 curl 调用示例
-test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线）
+examples/       采访整理包 JSON 示例；出处遮盖、预约发布、脉络路线、版本撤回 curl 调用示例
+test/           node:test 单元与端到端测试（含成环、无解、409 冲突、草稿恢复、整理包导入、出处遮盖、预约发布/重启补跑、脉络路线、版本撤回）
 ```
 
 ## 主要 HTTP API
 
 公开（无口令）：
 
-- `GET /api/public/chronicle` — 最新已发布版本完整快照（命中遮盖登记的 `source` 显示「出处已遮盖」）
-- `GET /api/public/versions` / `GET /api/public/versions/:no` — 版本清单 / 指定版本（指定版本同样应用遮盖）
-- `GET /api/public/routes` / `GET /api/public/routes/:no` — 脉络路线清单 / 路线详情（只含路线涉及的事件与关系，锚点与中间事件以 `role` 区分，出处同样应用遮盖）
+- `GET /api/public/chronicle` — 最新**未撤回**版本完整快照（命中遮盖登记的 `source` 显示「出处已遮盖」；全部撤回时 `published:false` 并提示「尚无可读版本」）
+- `GET /api/public/versions` / `GET /api/public/versions/:no` — 版本清单 / 指定版本（**已撤回版对访客隐藏**：清单不列出、指定版按不存在 404；未撤回版同样应用遮盖）
+- `GET /api/public/routes` / `GET /api/public/routes/:no` — 脉络路线清单 / 路线详情（只含路线涉及的事件与关系，锚点与中间事件以 `role` 区分，出处同样应用遮盖；**引用已撤回版的路线隐藏、直接访问 404**）
 
 编辑（需请求头 `X-Editor-Token`）：
 
-- `GET  /api/editor/state` — 草稿全貌 + 当前版本号 + 草稿修订号 `draftRevisionNo`
+- `POST /api/editor/versions/:no/retract` — 撤回第 `:no` 版；体含 `reason`（非空撤回原因）、`editor`
+  - 201：`{ok, alreadyRetracted:false, retraction:{versionNo, reason, editor, retractedAt}, currentVersionNo, latestVisibleVersionNo}`（只追加审计记录，快照与版本号不改）
+  - 200：重复撤回幂等，`alreadyRetracted:true` 并返回**首次记录**（不覆盖原因）
+  - 404：版本不存在；400：原因空 / 纯空白 / 非字符串 / 超长（均不改状态）
+- `GET  /api/editor/retractions` — 撤回审计清单（编辑者视角，含原因原文）
+- `GET  /api/editor/versions` — 版本清单（编辑者视角）：每版附 `retracted` 与 `retraction`（原因/编辑者/时间）；`currentVersionNo` 为最高已发布版本号（含撤回版，发布/预约基准），`latestVisibleVersionNo` 为访客当前可读版本
+- `GET  /api/editor/state` — 草稿全貌 + 当前版本号 + 草稿修订号 `draftRevisionNo`（另附 `latestVisibleVersionNo`）
 - 事件：`POST /api/editor/events`、`PUT/DELETE /api/editor/events/:id`
 - 主张：`POST /api/editor/events/:id/claims`、`PUT/DELETE /api/editor/claims/:claimId`
 - 关系：`POST /api/editor/relations`、`DELETE /api/editor/relations/:id`

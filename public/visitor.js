@@ -22,7 +22,8 @@ async function main() {
     const res = await fetch('/api/public/chronicle');
     const data = await res.json();
     if (!data.published) {
-      msg.innerHTML = '<div class="alert warn">年表尚未发布任何版本，敬请期待。<br><span class="muted">（草稿中的未发布内容对外不可见）</span></div>';
+      // 后端区分「从未发布」与「已发布版本均已撤回，尚无可读版本」
+      msg.innerHTML = `<div class="alert warn">${esc(data.message || '年表尚未发布任何版本')}<br><span class="muted">（草稿中的未发布内容对外不可见）</span></div>`;
       $('#versionTag').textContent = '未发布';
       return;
     }

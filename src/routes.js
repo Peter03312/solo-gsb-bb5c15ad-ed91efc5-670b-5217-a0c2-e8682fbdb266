@@ -24,6 +24,12 @@ const {
   applyRedactionToRoute,
   listRoutes,
 } = require('./route');
+const {
+  retractVersion,
+  isRetracted,
+  latestVisibleVersionNo,
+  listRetractions,
+} = require('./retract');
 const scheduler = require('./scheduler');
 
 const router = express.Router();
@@ -104,12 +110,16 @@ function readClaimPayload(body) {
 }
 
 // ================= 公开接口（访客，无需口令） =================
-// 只暴露最新已发布版本的不可变快照，不触碰草稿。
+// 只暴露最新未撤回版本的不可变快照，不触碰草稿；已撤回版对访客一律按不存在处理。
 
 router.get('/api/public/chronicle', (req, res) => {
-  const no = latestVersionNo();
+  // 访客最新年表指向编号最大的未撤回版
+  const no = latestVisibleVersionNo();
   if (no === 0) {
-    return res.json({ published: false, message: '年表尚未发布任何版本' });
+    // 区分「从未发布」与「已发布但全部撤回」，均无可读版本
+    const message =
+      latestVersionNo() === 0 ? '年表尚未发布任何版本' : '已发布版本均已撤回，尚无可读版本';
+    return res.json({ published: false, message });
   }
   // 访客视图：命中已登记出处的位置统一显示「出处已遮盖」，其余字段与版本号不变
   const version = applyRedactionToVersion(getVersionDetail(no));
@@ -117,35 +127,44 @@ router.get('/api/public/chronicle', (req, res) => {
 });
 
 router.get('/api/public/versions', (req, res) => {
-  const no = latestVersionNo();
+  // 访客版本清单隐藏已撤回版
   const rows = getDb()
     .prepare(
       `SELECT version_no AS versionNo, parent_no AS parentNo, editor, note, published_at AS publishedAt
-         FROM versions ORDER BY version_no DESC`
+         FROM versions
+        WHERE version_no NOT IN (SELECT version_no FROM version_retractions)
+        ORDER BY version_no DESC`
     )
     .all();
-  res.json({ currentVersionNo: no, versions: rows });
+  res.json({ currentVersionNo: latestVisibleVersionNo(), versions: rows });
 });
 
 router.get('/api/public/versions/:no', (req, res) => {
   const no = Number(req.params.no);
   const detail = getVersionDetail(no);
-  if (!detail) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
+  // 已撤回版按不存在处理
+  if (!detail || isRetracted(no)) throw { status: 404, message: `版本 ${req.params.no} 不存在` };
   // 访客读取指定历史版本同样应用出处遮盖
   res.json({ version: applyRedactionToVersion(detail) });
 });
 
 // ---- 专题「先于」脉络路线（公开只读） ----
 // 只展示路线涉及的事件与关系；出处命中遮盖登记的位置显示「出处已遮盖」。
+// 引用已撤回版的路线对访客隐藏，直接访问按不存在处理。
 router.get('/api/public/routes', (req, res) => {
-  res.json({ routes: listRoutes() });
+  const routes = listRoutes()
+    .filter((r) => !r.versionRetracted)
+    .map(({ versionRetracted, ...rest }) => rest);
+  res.json({ routes });
 });
 
 router.get('/api/public/routes/:no', (req, res) => {
   const no = Number(req.params.no);
   if (!Number.isInteger(no) || no < 1) throw badRequest('路线号必须是正整数');
   const detail = getRouteDetail(no);
-  if (!detail) throw { status: 404, message: `路线 ${req.params.no} 不存在` };
+  if (!detail || isRetracted(detail.versionNo)) {
+    throw { status: 404, message: `路线 ${req.params.no} 不存在` };
+  }
   res.json({ route: applyRedactionToRoute(detail) });
 });
 
@@ -168,6 +187,7 @@ router.get('/api/editor/state', (req, res) => {
   res.json({
     currentVersionNo: latestVersionNo(),
     currentVersion: getVersionSummary(latestVersionNo()) || null,
+    latestVisibleVersionNo: latestVisibleVersionNo(),
     draftRevisionNo: draftRevisionNo(),
     events,
     relations,
@@ -323,16 +343,57 @@ router.post('/api/editor/publish', (req, res) => {
   res.status(201).json({ ok: true, ...result });
 });
 
-// 版本列表（编辑者视角，结构与公开一致）
+// 版本列表（编辑者视角）：含撤回标记与撤回原因；currentVersionNo 为最高已发布版本号
+// （含撤回版，是发布/预约的基准），latestVisibleVersionNo 为访客当前可读版本。
 router.get('/api/editor/versions', (req, res) => {
-  const no = latestVersionNo();
   const rows = getDb()
     .prepare(
-      `SELECT version_no AS versionNo, parent_no AS parentNo, editor, note, published_at AS publishedAt
-         FROM versions ORDER BY version_no DESC`
+      `SELECT v.version_no AS versionNo, v.parent_no AS parentNo, v.editor, v.note,
+              v.published_at AS publishedAt,
+              r.reason AS retractReason, r.editor AS retractEditor, r.created_at AS retractedAt
+         FROM versions v
+         LEFT JOIN version_retractions r ON r.version_no = v.version_no
+        ORDER BY v.version_no DESC`
     )
     .all();
-  res.json({ currentVersionNo: no, versions: rows });
+  res.json({
+    currentVersionNo: latestVersionNo(),
+    latestVisibleVersionNo: latestVisibleVersionNo(),
+    versions: rows.map((row) => ({
+      versionNo: row.versionNo,
+      parentNo: row.parentNo,
+      editor: row.editor,
+      note: row.note,
+      publishedAt: row.publishedAt,
+      retracted: row.retractedAt != null,
+      retraction:
+        row.retractedAt != null
+          ? { reason: row.retractReason, editor: row.retractEditor, retractedAt: row.retractedAt }
+          : null,
+    })),
+  });
+});
+
+// ---- 撤回已发布版本：只追加审计记录，快照与版本号不改 ----
+// 体含 reason（非空撤回原因）、editor（可选）。版本不存在 → 404；原因非法 → 400；
+// 均不改状态。重复撤回幂等：200 返回首次记录（alreadyRetracted: true），不覆盖原因。
+router.post('/api/editor/versions/:no/retract', (req, res) => {
+  const body = req.body || {};
+  const result = retractVersion({
+    versionNo: Number(req.params.no),
+    reason: body.reason,
+    editor: optionalString(body, 'editor', 200) || '匿名编辑',
+  });
+  res.status(result.alreadyRetracted ? 200 : 201).json(result);
+});
+
+// 撤回审计清单（编辑者视角，含原因原文）
+router.get('/api/editor/retractions', (req, res) => {
+  res.json({
+    currentVersionNo: latestVersionNo(),
+    latestVisibleVersionNo: latestVisibleVersionNo(),
+    retractions: listRetractions(),
+  });
 });
 
 // ---- 从已发布版本恢复草稿：只读预览，不改数据 ----

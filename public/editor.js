@@ -74,7 +74,12 @@ function showPublishResult(kind, html) {
 // ---------- 渲染 ----------
 function render() {
   $('#versionTag').textContent =
-    state.currentVersionNo === 0 ? '尚无已发布版本（草稿未公开）' : `当前已发布：第 ${state.currentVersionNo} 版`;
+    state.currentVersionNo === 0
+      ? '尚无已发布版本（草稿未公开）'
+      : `当前已发布：第 ${state.currentVersionNo} 版` +
+        (state.latestVisibleVersionNo !== state.currentVersionNo
+          ? `（访客可见：${state.latestVisibleVersionNo ? `第 ${state.latestVisibleVersionNo} 版` : '无 · 全部撤回'}）`
+          : '');
 
   const sel = store.selections;
   $('#eventList').innerHTML = state.events.map((ev) => {
@@ -214,13 +219,18 @@ async function loadVersions() {
         <div class="rel-line">
           <div class="row" style="align-items:center">
             <strong>第 ${v.versionNo} 版</strong>
+            ${v.retracted ? '<span class="badge" style="background:#fbeaea;color:#a33">已撤回</span>' : ''}
             <span class="muted" style="flex:1">${v.publishedAt.replace('T', ' ').slice(0, 16)} UTC · ${esc(v.editor || '匿名')}${v.parentNo ? ` · 基于第 ${v.parentNo} 版` : ''}</span>
+            ${!v.retracted ? `<button class="danger" type="button" data-retract-version="${v.versionNo}" style="padding:2px 10px;font-size:13px">撤回该版</button>` : ''}
             <button class="secondary" type="button" data-restore-version="${v.versionNo}" style="padding:2px 10px;font-size:13px">预览并恢复草稿</button>
           </div>
+          ${v.retracted ? `<div class="muted" style="color:#a33">已撤回：${esc(v.retraction.reason)}（${esc(v.retraction.retractedAt)} UTC · ${esc(v.retraction.editor || '匿名')}）。访客已看不到本版；快照原文仍可查看。</div>` : ''}
           ${v.note ? `<div>${esc(v.note)}</div>` : ''}
           <div>
             <button class="linkbtn" type="button" data-raw-version="${v.versionNo}">查看该版快照原文（编辑者，不遮盖）</button>
-            · <a href="/api/public/versions/${v.versionNo}" target="_blank">访客视角 JSON（遮盖后）</a>
+            ${v.retracted
+              ? '<span class="muted">· 访客视角：本版已隐藏（按不存在处理）</span>'
+              : `· <a href="/api/public/versions/${v.versionNo}" target="_blank">访客视角 JSON（遮盖后）</a>`}
           </div>
         </div>`).join('')
     : '尚无版本。';
@@ -693,6 +703,51 @@ async function openRawVersion(versionNo) {
   }
 }
 
+// ---------- 撤回已发布版本（只追加审计记录，快照与版本号不改） ----------
+let retractTarget = null; // 待撤回的版本号
+
+function openRetractDialog(versionNo) {
+  retractTarget = versionNo;
+  $('#retractVersionNo').textContent = versionNo;
+  $('#retractReason').value = '';
+  $('#retractMsg').innerHTML = '';
+  $('#retractConfirm').disabled = false;
+  $('#retractDialog').showModal();
+}
+
+async function confirmRetract() {
+  if (!retractTarget) return;
+  const reason = $('#retractReason').value;
+  if (!reason.trim()) {
+    $('#retractMsg').innerHTML = '<div class="alert error">撤回原因不能为空：请说明该版编年依据的错误。</div>';
+    return;
+  }
+  const btn = $('#retractConfirm');
+  btn.disabled = true;
+  try {
+    const data = await api('POST', `/api/editor/versions/${retractTarget}/retract`, {
+      reason,
+      editor: store.editor || '匿名编辑',
+    });
+    $('#retractDialog').close();
+    retractTarget = null;
+    const r = data.retraction;
+    if (data.alreadyRetracted) {
+      showGlobal('warn', `第 ${r.versionNo} 版<b>此前已撤回</b>（${esc(r.retractedAt)} UTC · ${esc(r.editor || '匿名')}），
+        原因：${esc(r.reason)}。本次为重复撤回，未覆盖首次记录。`);
+    } else {
+      showGlobal('ok', `已撤回 <b>第 ${r.versionNo} 版</b>（原因：${esc(r.reason)}）。
+        历史快照与版本号未改；访客最新年表现指向${data.latestVisibleVersionNo ? `第 ${data.latestVisibleVersionNo} 版` : '<b>无</b>（全部撤回，尚无可读版本）'}，
+        引用该版的专题路线对访客隐藏。发布与预约仍以最高已发布版本号（第 ${data.currentVersionNo} 版）为基准。`);
+    }
+    await loadState();
+  } catch (err) {
+    if (err.message === 'unauthorized') { $('#retractDialog').close(); return; }
+    $('#retractMsg').innerHTML = `<div class="alert error">${esc(err.message)}</div>`;
+    btn.disabled = false;
+  }
+}
+
 // ---------- 预约发布 ----------
 function showScheduleResult(kind, html) {
   $('#scheduleResult').innerHTML = `<div class="alert ${kind}">${html}</div>`;
@@ -965,9 +1020,12 @@ function renderRouteList(routes) {
       <div class="row" style="align-items:center">
         <strong>#${r.routeNo} ${esc(r.title)}</strong>
         <span class="badge">据第 ${r.versionNo} 版</span>
+        ${r.versionRetracted ? '<span class="badge" style="background:#fbeaea;color:#a33">所据版本已撤回（访客不可见）</span>' : ''}
         <span class="muted" style="flex:1">${r.anchorCount} 个锚点 · ${r.segmentCount} 段 · ${esc(r.createdAt)} UTC · ${esc(r.editor || '匿名')}</span>
         <button class="secondary" type="button" data-view-route="${r.routeNo}" style="padding:2px 10px;font-size:13px">查看路线（原文）</button>
-        <a href="/api/public/routes/${r.routeNo}" target="_blank" style="font-size:13px">访客视角 JSON</a>
+        ${r.versionRetracted
+          ? '<span class="muted" style="font-size:13px">访客视角：已隐藏</span>'
+          : `<a href="/api/public/routes/${r.routeNo}" target="_blank" style="font-size:13px">访客视角 JSON</a>`}
       </div>
       ${r.note ? `<div class="muted">说明：${esc(r.note)}</div>` : ''}
     </div>`).join('');
@@ -1112,6 +1170,12 @@ async function onClick(e) {
   if (t.id === 'rawVersionClose') { $('#rawVersionDialog').close(); return; }
   const rawVersion = t.dataset && t.dataset.rawVersion;
   if (rawVersion !== undefined) return openRawVersion(Number(rawVersion));
+
+  // 撤回已发布版本
+  const retractVersion = t.dataset && t.dataset.retractVersion;
+  if (retractVersion !== undefined) return openRetractDialog(Number(retractVersion));
+  if (t.id === 'retractCancel') { $('#retractDialog').close(); retractTarget = null; return; }
+  if (t.id === 'retractConfirm') return confirmRetract();
 
   // 专题脉络路线
   if (t.id === 'btnRouteLoadEvents') return loadRouteVersionEvents();

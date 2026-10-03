@@ -168,7 +168,8 @@
 
         <div class="card">
           <h2>已发布版本</h2>
-          <p class="muted">历史快照不可变。可从任一已发布版本<b>预览并恢复草稿</b>：原子替换当前草稿（只带回该版被选主张），历史快照与访客年表不受影响；恢复后仍需校验、发布才会公开。</p>
+          <p class="muted">历史快照不可变。可从任一已发布版本<b>预览并恢复草稿</b>：原子替换当前草稿（只带回该版被选主张），历史快照与访客年表不受影响；恢复后仍需校验、发布才会公开。
+            发现某版编年依据错误时可<b>撤回该版</b>：只追加审计记录（快照与版本号不改），访客立即看不到该版，引用该版的专题路线对访客隐藏；编辑者仍可查看原文与原因。</p>
           <div id="versionList" class="muted">加载中…</div>
         </div>
       </section>
@@ -221,6 +222,25 @@
     <div class="d-body" id="rawVersionBody">加载中…</div>
     <div class="d-foot">
       <button id="rawVersionClose" type="button" class="secondary">关闭</button>
+    </div>
+  </dialog>
+
+  <!-- 撤回已发布版本对话框 -->
+  <dialog id="retractDialog">
+    <div class="d-head" style="background:#fbeaea;color:#a33;border-color:#e0b8b8">⛔ 撤回第 <span id="retractVersionNo"></span> 版</div>
+    <div class="d-body">
+      <p>发现该版编年依据错误时可撤回整版。撤回<b>只追加审计记录</b>：历史快照与版本号不变，
+        访客立即不再看到该版——最新年表退到编号最大的未撤回版（全部撤回则显示「尚无可读版本」），
+        引用该版的专题路线对访客隐藏。编辑者持口令仍可查看该版原文与撤回原因。</p>
+      <p class="muted">撤回后发布与预约仍以<b>最高已发布版本号</b>为基准、编号继续递增；
+        以该版为冻结基准的待执行预约到期将转为冲突，不生成新版本。重复撤回不覆盖首次原因。</p>
+      <label>撤回原因（必填，记入审计；重复撤回不覆盖首次原因）</label>
+      <textarea id="retractReason" rows="3" placeholder="如：「春月会议」编年依据错误，受访人更正为 1959 年 3 月，待重新核定"></textarea>
+      <div id="retractMsg" style="margin-top:10px"></div>
+    </div>
+    <div class="d-foot">
+      <button class="secondary" id="retractCancel" type="button">取消</button>
+      <button class="danger" id="retractConfirm" type="button">确认撤回该版</button>
     </div>
   </dialog>
 

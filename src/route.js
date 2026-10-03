@@ -20,6 +20,7 @@
 const { getDb } = require('./db');
 const { getVersionDetail } = require('./publish');
 const { redactedSourceSet, REDACTED_SOURCE } = require('./redact');
+const { isRetracted } = require('./retract');
 
 const MAX_TITLE_LEN = 200;
 
@@ -91,6 +92,14 @@ function createRoute({ title, versionNo, anchorEventIds, editor = '', note = '' 
   const version = getVersionDetail(no);
   if (!version) {
     throw { status: 404, message: `版本 ${versionNo} 不存在，路线未保存` };
+  }
+  // 已撤回版对访客不可见，不能以其为所据版本建立新路线（已有路线保留并对访客隐藏）
+  if (isRetracted(no)) {
+    throw {
+      status: 409,
+      code: 'VERSION_RETRACTED',
+      message: `第 ${no} 版已撤回，不能以其为所据版本建立路线，路线未保存`,
+    };
   }
 
   // 3) 锚点序列：至少两个、整数、互异
@@ -313,7 +322,8 @@ function applyRedactionToRoute(route, redactedSet = redactedSourceSet()) {
   };
 }
 
-// 路线清单（摘要；公开与编辑者共用结构）
+// 路线清单（摘要；公开与编辑者共用结构）。
+// versionRetracted 标记所据版本是否已撤回：公开接口据此隐藏，编辑者接口保留展示。
 function listRoutes() {
   const db = getDb();
   return db
@@ -321,10 +331,12 @@ function listRoutes() {
       `SELECT r.id AS routeNo, r.title, r.version_no AS versionNo, r.editor, r.note,
               r.created_at AS createdAt,
               (SELECT COUNT(*) FROM route_anchors a WHERE a.route_id = r.id) AS anchorCount,
-              (SELECT COUNT(*) FROM route_segments s WHERE s.route_id = r.id) AS segmentCount
+              (SELECT COUNT(*) FROM route_segments s WHERE s.route_id = r.id) AS segmentCount,
+              (r.version_no IN (SELECT version_no FROM version_retractions)) AS versionRetracted
          FROM routes r ORDER BY r.id DESC`
     )
-    .all();
+    .all()
+    .map((row) => ({ ...row, versionRetracted: Boolean(row.versionRetracted) }));
 }
 
 module.exports = {
